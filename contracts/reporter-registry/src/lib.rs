@@ -3,7 +3,7 @@
 #![no_std]
 
 use plimsoll_types::{
-    PendingUpgrade, ReporterInfo, Role, INSTANCE_EXTEND_TO, INSTANCE_THRESHOLD,
+    PendingUpgrade, RegistryRole, ReporterInfo, Role, INSTANCE_EXTEND_TO, INSTANCE_THRESHOLD,
     PERSISTENT_EXTEND_TO, PERSISTENT_THRESHOLD, UPGRADE_DELAY_LEDGERS,
 };
 use soroban_sdk::{
@@ -19,6 +19,8 @@ enum DataKey {
     Admin,
     Reporter(Address),
     PendingUpgrade,
+    /// Explicit access tier assigned to an address via `assign_role`.
+    AccessRole(Address),
 }
 
 #[contracterror]
@@ -76,6 +78,21 @@ pub struct UpgradeCancelled {
     pub wasm_hash: BytesN<32>,
 }
 
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoleAssigned {
+    #[topic]
+    pub assignee: Address,
+    pub tier: RegistryRole,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoleRevoked {
+    #[topic]
+    pub assignee: Address,
+}
+
 #[contract]
 pub struct ReporterRegistry;
 
@@ -98,16 +115,35 @@ fn pending(env: &Env) -> Option<PendingUpgrade> {
 
 #[contractimpl]
 impl ReporterRegistry {
+    /// Initialises the registry with `admin` as the sole administrator.
+    ///
+    /// # Arguments
+    /// * `admin` - the address that will control this contract
     pub fn __constructor(env: Env, admin: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
         bump_instance(&env);
     }
 
+    /// Returns the current administrator address.
     pub fn admin(env: Env) -> Address {
         admin(&env)
     }
 
     /// Add a reporter, or change an existing reporter's role and name.
+    ///
+    /// If `reporter` already exists, `added_at` is preserved; otherwise it is
+    /// set to the current ledger timestamp.
+    ///
+    /// # Arguments
+    /// * `reporter` - the address being registered or updated
+    /// * `role` - `Auditor`, `Transcriber`, or `SupplyPoster`
+    /// * `name` - display name, 1–64 bytes
+    ///
+    /// # Errors
+    /// * [`RegistryError::InvalidName`] when `name` is empty or longer than 64 bytes
+    ///
+    /// # Events
+    /// * [`ReporterSet`] on success
     pub fn set_reporter(env: Env, reporter: Address, role: Role, name: String) {
         admin(&env).require_auth();
         if name.is_empty() || name.len() > MAX_NAME_LEN {
@@ -138,6 +174,16 @@ impl ReporterRegistry {
         .publish(&env);
     }
 
+    /// Remove a reporter from the registry.
+    ///
+    /// # Arguments
+    /// * `reporter` - the address to revoke
+    ///
+    /// # Errors
+    /// * [`RegistryError::ReporterNotFound`] when `reporter` is not registered
+    ///
+    /// # Events
+    /// * [`ReporterRevoked`] on success
     pub fn revoke(env: Env, reporter: Address) {
         admin(&env).require_auth();
         let key = DataKey::Reporter(reporter.clone());
@@ -149,10 +195,18 @@ impl ReporterRegistry {
         ReporterRevoked { reporter }.publish(&env);
     }
 
+    /// Return the role of `reporter`, or `None` if not registered.
+    ///
+    /// # Arguments
+    /// * `reporter` - the address to query
     pub fn role_of(env: Env, reporter: Address) -> Option<Role> {
         Self::get_reporter(env, reporter).map(|info| info.role)
     }
 
+    /// Return the full reporter record for `reporter`, or `None` if not registered.
+    ///
+    /// # Arguments
+    /// * `reporter` - the address to query
     pub fn get_reporter(env: Env, reporter: Address) -> Option<ReporterInfo> {
         let key = DataKey::Reporter(reporter);
         let info = env.storage().persistent().get::<_, ReporterInfo>(&key);
@@ -164,6 +218,14 @@ impl ReporterRegistry {
         info
     }
 
+    /// Transfer admin rights to `new_admin`. Requires both current and new
+    /// admin to authorise.
+    ///
+    /// # Arguments
+    /// * `new_admin` - the address that will become administrator
+    ///
+    /// # Events
+    /// * [`AdminTransferred`] on success
     pub fn transfer_admin(env: Env, new_admin: Address) {
         admin(&env).require_auth();
         new_admin.require_auth();
@@ -174,6 +236,12 @@ impl ReporterRegistry {
 
     /// Propose a wasm hash for installation after the upgrade delay. A new
     /// proposal replaces any pending one and restarts the clock.
+    ///
+    /// # Arguments
+    /// * `wasm_hash` - hash of the new wasm to install
+    ///
+    /// # Events
+    /// * [`UpgradeProposed`] on success
     pub fn propose_upgrade(env: Env, wasm_hash: BytesN<32>) {
         admin(&env).require_auth();
         let executable_at_ledger = env
@@ -196,6 +264,13 @@ impl ReporterRegistry {
     }
 
     /// Install the pending wasm once its delay has elapsed.
+    ///
+    /// # Errors
+    /// * [`RegistryError::UpgradeNotProposed`] when no upgrade has been proposed
+    /// * [`RegistryError::UpgradeDelayNotElapsed`] when the delay has not yet passed
+    ///
+    /// # Events
+    /// * [`UpgradeExecuted`] on success
     pub fn execute_upgrade(env: Env) {
         admin(&env).require_auth();
         let proposed = match pending(&env) {
@@ -216,6 +291,12 @@ impl ReporterRegistry {
     }
 
     /// Cancel the pending upgrade.
+    ///
+    /// # Errors
+    /// * [`RegistryError::UpgradeNotProposed`] when no upgrade has been proposed
+    ///
+    /// # Events
+    /// * [`UpgradeCancelled`] on success
     pub fn cancel_upgrade(env: Env) {
         admin(&env).require_auth();
         let proposed = match pending(&env) {
@@ -230,13 +311,88 @@ impl ReporterRegistry {
         .publish(&env);
     }
 
-    /// The pending upgrade, if any.
+    /// Return the pending upgrade, if any.
     pub fn pending_upgrade(env: Env) -> Option<PendingUpgrade> {
         let proposed = pending(&env);
         if proposed.is_some() {
             bump_instance(&env);
         }
         proposed
+    }
+
+    /// Assign an explicit access tier to `assignee`. Requires admin auth.
+    ///
+    /// An explicit tier overrides the implicit `Reporter` tier that any address
+    /// registered via `set_reporter` would otherwise have. Existing reporter
+    /// records are unaffected.
+    ///
+    /// # Arguments
+    /// * `assignee` - the address receiving the tier
+    /// * `tier` - the `RegistryRole` tier to assign
+    ///
+    /// # Events
+    /// * [`RoleAssigned`] on success
+    pub fn assign_role(env: Env, assignee: Address, tier: RegistryRole) {
+        admin(&env).require_auth();
+        let key = DataKey::AccessRole(assignee.clone());
+        env.storage().persistent().set(&key, &tier);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PERSISTENT_THRESHOLD, PERSISTENT_EXTEND_TO);
+        bump_instance(&env);
+        RoleAssigned { assignee, tier }.publish(&env);
+    }
+
+    /// Remove the explicit access tier of `assignee`. Requires admin auth.
+    ///
+    /// If `assignee` is also a registered reporter, they revert to the implicit
+    /// `Reporter` tier returned by `access_tier`. If not registered, their tier
+    /// becomes `None`.
+    ///
+    /// This is a no-op when `assignee` has no explicit tier.
+    ///
+    /// # Arguments
+    /// * `assignee` - the address whose explicit tier is removed
+    ///
+    /// # Events
+    /// * [`RoleRevoked`] on success
+    pub fn revoke_role(env: Env, assignee: Address) {
+        admin(&env).require_auth();
+        env.storage()
+            .persistent()
+            .remove(&DataKey::AccessRole(assignee.clone()));
+        bump_instance(&env);
+        RoleRevoked { assignee }.publish(&env);
+    }
+
+    /// Return the access tier of `address`.
+    ///
+    /// An explicit tier set via `assign_role` takes precedence. If none is set,
+    /// any address registered via `set_reporter` is treated as `Reporter` tier.
+    /// Returns `None` for addresses with neither.
+    ///
+    /// # Arguments
+    /// * `address` - the address to query
+    pub fn access_tier(env: Env, address: Address) -> Option<RegistryRole> {
+        let key = DataKey::AccessRole(address.clone());
+        if let Some(tier) = env
+            .storage()
+            .persistent()
+            .get::<_, RegistryRole>(&key)
+        {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, PERSISTENT_THRESHOLD, PERSISTENT_EXTEND_TO);
+            return Some(tier);
+        }
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Reporter(address))
+        {
+            return Some(RegistryRole::Reporter);
+        }
+        None
     }
 }
 
