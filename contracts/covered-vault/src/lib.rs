@@ -99,6 +99,14 @@ fn set_balance(env: &Env, who: &Address, amount: i128) {
 
 #[contractimpl]
 impl CoveredVault {
+    /// Initialises the vault.
+    ///
+    /// # Arguments
+    /// * `ledger` - address of the coverage-ledger contract used as the deposit gate
+    /// * `asset` - the token this vault accepts
+    /// * `min_bps` - minimum coverage ratio in basis points required to open the gate (10 000 = 100%)
+    /// * `max_age` - maximum age of supply and reserve data in seconds
+    /// * `min_tier` - minimum report tier required to open the deposit gate
     pub fn __constructor(
         env: Env,
         ledger: Address,
@@ -120,6 +128,18 @@ impl CoveredVault {
             .extend_ttl(INSTANCE_THRESHOLD, INSTANCE_EXTEND_TO);
     }
 
+    /// Accept a deposit from `from` while coverage is open.
+    ///
+    /// # Arguments
+    /// * `from` - the depositor; must authorise this call
+    /// * `amount` - asset units to transfer in; must be positive
+    ///
+    /// # Errors
+    /// * [`VaultError::InvalidAmount`] when `amount ≤ 0`
+    /// * [`VaultError::NotCovered`] when the coverage gate is closed at call time
+    ///
+    /// # Events
+    /// * [`Deposited`] on success
     pub fn deposit(env: Env, from: Address, amount: i128) -> i128 {
         from.require_auth();
         if amount <= 0 {
@@ -145,6 +165,23 @@ impl CoveredVault {
         new_balance
     }
 
+    /// Withdraw `amount` from the caller's vault balance. Never blocked by
+    /// coverage — users can always exit regardless of coverage status.
+    ///
+    /// Uses the checks-effects-interactions pattern: the internal balance is
+    /// decremented before the token transfer, making re-entrancy from the SAC
+    /// callback unable to observe the pre-withdrawal balance.
+    ///
+    /// # Arguments
+    /// * `to` - the withdrawer; must authorise this call
+    /// * `amount` - asset units to withdraw; must be positive
+    ///
+    /// # Errors
+    /// * [`VaultError::InvalidAmount`] when `amount ≤ 0`
+    /// * [`VaultError::InsufficientBalance`] when `amount > current_balance`
+    ///
+    /// # Events
+    /// * [`Withdrawn`] on success
     pub fn withdraw(env: Env, to: Address, amount: i128) -> i128 {
         to.require_auth();
         if amount <= 0 {
@@ -166,15 +203,20 @@ impl CoveredVault {
         new_balance
     }
 
+    /// Return the vault balance of `of`.
+    ///
+    /// # Arguments
+    /// * `of` - the address to query
     pub fn balance(env: Env, of: Address) -> i128 {
         balance_of(&env, &of)
     }
 
+    /// Return the vault's immutable configuration.
     pub fn config(env: Env) -> VaultConfig {
         config(&env)
     }
 
-    /// Whether a positive deposit would pass the coverage gate right now.
+    /// Return `true` when a positive deposit would pass the coverage gate right now.
     pub fn can_deposit(env: Env) -> bool {
         is_open(&env, &config(&env))
     }
