@@ -4,9 +4,10 @@
 #![no_std]
 
 use plimsoll_types::{
-    coverage_bps, AssetRecord, Coverage, PendingUpgrade, RegistryClient, ReserveReport, Role,
-    SupplySnapshot, Tier, INSTANCE_EXTEND_TO, INSTANCE_THRESHOLD, MAX_PLAUSIBLE_BPS,
-    MIN_PLAUSIBLE_BPS, PERSISTENT_EXTEND_TO, PERSISTENT_THRESHOLD, UPGRADE_DELAY_LEDGERS,
+    coverage_bps, AssetRecord, Coverage, CoverageSnapshot, PendingUpgrade, RegistryClient,
+    ReserveReport, Role, SupplySnapshot, Tier, INSTANCE_EXTEND_TO, INSTANCE_THRESHOLD,
+    MAX_PLAUSIBLE_BPS, MIN_PLAUSIBLE_BPS, PERSISTENT_EXTEND_TO, PERSISTENT_THRESHOLD,
+    UPGRADE_DELAY_LEDGERS,
 };
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, token,
@@ -23,6 +24,9 @@ const MAX_CODE_LEN: usize = 12;
 /// `coverage` reads, and so what every `is_covered` caller pays.
 pub const MAX_REPORTERS_PER_TIER: u32 = 4;
 
+/// Maximum coverage snapshots kept per asset in the history ring buffer.
+pub const HISTORY_CAPACITY: u32 = 10;
+
 #[contracttype]
 #[derive(Clone)]
 enum DataKey {
@@ -37,6 +41,12 @@ enum DataKey {
     ReportBy(Address, Tier, Address),
     /// Reporters with a `ReportBy` entry at (sac, tier), in first-post order.
     Reporters(Address, Tier),
+    /// One slot in the coverage-history ring buffer for `sac`.
+    HistorySlot(Address, u32),
+    /// Next write index for `sac`'s history ring buffer (wraps on overflow).
+    HistoryHead(Address),
+    /// Number of entries in `sac`'s ring buffer, capped at `HISTORY_CAPACITY`.
+    HistoryCount(Address),
 }
 
 #[contracterror]
@@ -324,24 +334,58 @@ fn reclaim_slots(
     kept
 }
 
+/// Append `snapshot` to the ring buffer for `sac`. The oldest entry is
+/// overwritten once the buffer reaches `HISTORY_CAPACITY`.
+fn history_push(env: &Env, sac: &Address, snapshot: CoverageSnapshot) {
+    let head_key = DataKey::HistoryHead(sac.clone());
+    let count_key = DataKey::HistoryCount(sac.clone());
+    let head: u32 = read_persistent::<u32>(env, &head_key).unwrap_or(0);
+    let count: u32 = read_persistent::<u32>(env, &count_key).unwrap_or(0);
+    let slot = head % HISTORY_CAPACITY;
+    write_persistent(env, &DataKey::HistorySlot(sac.clone(), slot), &snapshot);
+    write_persistent(env, &head_key, &head.wrapping_add(1));
+    if count < HISTORY_CAPACITY {
+        write_persistent(env, &count_key, &(count + 1));
+    }
+}
+
 #[contractimpl]
 impl CoverageLedger {
+    /// Initialises the ledger with `admin` as administrator and `registry` as
+    /// the reporter-registry used to validate reporter roles.
+    ///
+    /// # Arguments
+    /// * `admin` - address that controls upgrades and admin transfer
+    /// * `registry` - address of the reporter-registry contract
     pub fn __constructor(env: Env, admin: Address, registry: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Registry, &registry);
         bump_instance(&env);
     }
 
+    /// Returns the current administrator address.
     pub fn admin(env: Env) -> Address {
         admin(&env)
     }
 
+    /// Returns the reporter-registry address used to validate roles.
     pub fn registry(env: Env) -> Address {
         registry(&env)
     }
 
     /// List a Stellar-issued asset by its Stellar Asset Contract address.
+    ///
     /// Permissionless: the code and issuer are read from the SAC itself.
+    ///
+    /// # Arguments
+    /// * `sac` - address of the Stellar Asset Contract to list
+    ///
+    /// # Errors
+    /// * [`LedgerError::NotAStellarAsset`] when `sac` is not a Stellar Asset Contract or its name is malformed
+    /// * [`LedgerError::AlreadyListed`] when `sac` is already listed
+    ///
+    /// # Events
+    /// * [`AssetListed`] on success
     pub fn list_asset(env: Env, sac: Address) -> AssetRecord {
         if sac.executable() != Some(Executable::StellarAsset) {
             panic_with_error!(&env, LedgerError::NotAStellarAsset);
@@ -368,6 +412,23 @@ impl CoverageLedger {
     }
 
     /// Record the circulating supply of `sac` as computed at `ledger`.
+    ///
+    /// # Arguments
+    /// * `poster` - registered supply-poster; must authorise this call
+    /// * `sac` - the listed asset
+    /// * `amount` - circulating supply in the asset's smallest unit; must be non-negative
+    /// * `ledger` - ledger sequence at which this supply was computed; must not be in the future or stale
+    /// * `breakdown_hash` - SHA-256 of the off-chain supply breakdown document
+    ///
+    /// # Errors
+    /// * [`LedgerError::NotSupplyPoster`] when `poster` is not a registered supply-poster
+    /// * [`LedgerError::AssetNotListed`] when `sac` has not been listed
+    /// * [`LedgerError::InvalidAmount`] when `amount` is negative
+    /// * [`LedgerError::FutureLedger`] when `ledger` is ahead of the current sequence
+    /// * [`LedgerError::StaleLedger`] when `ledger` is not strictly after the previous snapshot
+    ///
+    /// # Events
+    /// * [`SupplyPosted`] on success
     pub fn post_supply(
         env: Env,
         poster: Address,
@@ -404,18 +465,54 @@ impl CoverageLedger {
         write_persistent(&env, &key, &snapshot);
         bump_instance(&env);
         SupplyPosted {
-            sac,
+            sac: sac.clone(),
             amount,
             ledger,
             breakdown_hash,
             poster,
         }
         .publish(&env);
+        // History: push a coverage snapshot if any counting report exists.
+        if let Some(bst) = best_report(&env, &sac, Tier::Transcribed) {
+            history_push(
+                &env,
+                &sac,
+                CoverageSnapshot {
+                    bps: coverage_bps(bst.amount, snapshot.amount),
+                    supply: snapshot.amount,
+                    reserves: bst.amount,
+                    tier: bst.tier,
+                    ledger: env.ledger().sequence(),
+                    timestamp: env.ledger().timestamp(),
+                },
+            );
+        }
     }
 
     /// Record a reserve figure for `sac`. The reporter's identity sets the
     /// tier: the asset's issuer account, a registered auditor, or a
     /// registered transcriber.
+    ///
+    /// # Arguments
+    /// * `reporter` - must authorise this call; determines the report's tier
+    /// * `sac` - the listed asset
+    /// * `amount` - reserves in the asset's smallest unit; must be non-negative
+    /// * `as_of` - Unix timestamp the reserves were measured at; must not be in the future or stale for this reporter
+    /// * `doc_hash` - SHA-256 of the attestation document
+    /// * `doc_uri` - URI of the attestation document; 1–256 bytes
+    ///
+    /// # Errors
+    /// * [`LedgerError::AssetNotListed`] when `sac` has not been listed
+    /// * [`LedgerError::NotReporter`] when `reporter` has no applicable role
+    /// * [`LedgerError::InvalidAmount`] when `amount` is negative
+    /// * [`LedgerError::InvalidUri`] when `doc_uri` is empty or longer than 256 bytes
+    /// * [`LedgerError::FutureTimestamp`] when `as_of` is ahead of the current ledger timestamp
+    /// * [`LedgerError::ImplausibleAmount`] when the reserve-to-supply ratio is outside the plausible range
+    /// * [`LedgerError::StaleReport`] when `as_of` is not strictly after this reporter's previous `as_of`
+    /// * [`LedgerError::TooManyReporters`] when the tier is full and no revoked slots can be reclaimed
+    ///
+    /// # Events
+    /// * [`ReservePosted`] on success
     pub fn post_reserve(
         env: Env,
         reporter: Address,
@@ -499,7 +596,7 @@ impl CoverageLedger {
         write_persistent(&env, &key, &report);
         bump_instance(&env);
         ReservePosted {
-            sac,
+            sac: sac.clone(),
             tier,
             amount,
             as_of,
@@ -508,24 +605,56 @@ impl CoverageLedger {
             doc_uri,
         }
         .publish(&env);
+        // History: push a coverage snapshot if supply exists.
+        if let Some(sup) = read_persistent::<SupplySnapshot>(&env, &DataKey::Supply(sac.clone())) {
+            if let Some(bst) = best_report(&env, &sac, Tier::Transcribed) {
+                history_push(
+                    &env,
+                    &sac,
+                    CoverageSnapshot {
+                        bps: coverage_bps(bst.amount, sup.amount),
+                        supply: sup.amount,
+                        reserves: bst.amount,
+                        tier: bst.tier,
+                        ledger: env.ledger().sequence(),
+                        timestamp: now,
+                    },
+                );
+            }
+        }
         tier
     }
 
+    /// Return the asset record for `sac`, or `None` if not listed.
+    ///
+    /// # Arguments
+    /// * `sac` - the asset to look up
     pub fn get_asset(env: Env, sac: Address) -> Option<AssetRecord> {
         read_persistent(&env, &DataKey::Asset(sac))
     }
 
+    /// Return the most recent supply snapshot for `sac`, or `None` if none has been posted.
+    ///
+    /// # Arguments
+    /// * `sac` - the listed asset
     pub fn get_supply(env: Env, sac: Address) -> Option<SupplySnapshot> {
         read_persistent(&env, &DataKey::Supply(sac))
     }
 
-    /// The freshest report at `tier` that still counts.
+    /// Return the freshest counting report at `tier`, or `None` if none exists.
+    ///
+    /// # Arguments
+    /// * `sac` - the listed asset
+    /// * `tier` - the report tier to query
     pub fn get_report(env: Env, sac: Address, tier: Tier) -> Option<ReserveReport> {
         freshest_at(&env, &sac, tier)
     }
 
-    /// Every stored report that still counts, strongest tier first, then
-    /// first-post order within a tier.
+    /// Return every stored report that still counts, strongest tier first,
+    /// then first-post order within a tier.
+    ///
+    /// # Arguments
+    /// * `sac` - the listed asset
     pub fn get_reports(env: Env, sac: Address) -> Vec<ReserveReport> {
         let registry = RegistryClient::new(&env, &registry(&env));
         let mut out = Vec::new(&env);
@@ -539,7 +668,14 @@ impl CoverageLedger {
         out
     }
 
-    /// Latest supply against the freshest report at `min_tier` or stronger.
+    /// Return the latest supply against the freshest report at `min_tier` or stronger.
+    ///
+    /// Returns `None` when no supply snapshot or no counting report at or above
+    /// `min_tier` has been posted.
+    ///
+    /// # Arguments
+    /// * `sac` - the listed asset
+    /// * `min_tier` - weakest report tier that satisfies the query
     pub fn coverage(env: Env, sac: Address, min_tier: Tier) -> Option<Coverage> {
         let supply = read_persistent::<SupplySnapshot>(&env, &DataKey::Supply(sac.clone()))?;
         let report = best_report(&env, &sac, min_tier)?;
@@ -554,8 +690,14 @@ impl CoverageLedger {
         })
     }
 
-    /// True when both the supply snapshot and the chosen report are at most
-    /// `max_age` seconds old and coverage is at least `min_bps`.
+    /// Return `true` when both the supply snapshot and the chosen report are at
+    /// most `max_age` seconds old and coverage is at least `min_bps`.
+    ///
+    /// # Arguments
+    /// * `sac` - the listed asset
+    /// * `min_bps` - minimum coverage ratio in basis points
+    /// * `max_age` - maximum age of supply and reserve data in seconds
+    /// * `min_tier` - weakest report tier that satisfies the query
     pub fn is_covered(env: Env, sac: Address, min_bps: u32, max_age: u64, min_tier: Tier) -> bool {
         let coverage = match Self::coverage(env.clone(), sac, min_tier) {
             Some(c) => c,
@@ -566,6 +708,41 @@ impl CoverageLedger {
         fresh(coverage.supply_timestamp) && fresh(coverage.report_as_of) && coverage.bps >= min_bps
     }
 
+    /// Return up to `limit` coverage snapshots for `sac`, newest first.
+    ///
+    /// Each snapshot is recorded automatically whenever a supply or reserve
+    /// post results in both supply and a counting report being present.
+    ///
+    /// # Arguments
+    /// * `sac` - the listed asset
+    /// * `limit` - maximum number of entries to return; clamped to `HISTORY_CAPACITY`
+    pub fn get_coverage_history(env: Env, sac: Address, limit: u32) -> Vec<CoverageSnapshot> {
+        let head: u32 =
+            read_persistent::<u32>(&env, &DataKey::HistoryHead(sac.clone())).unwrap_or(0);
+        let count: u32 =
+            read_persistent::<u32>(&env, &DataKey::HistoryCount(sac.clone())).unwrap_or(0);
+        let take = limit.min(count);
+        let mut out = Vec::new(&env);
+        for i in 0..take {
+            let slot = head.wrapping_sub(i + 1) % HISTORY_CAPACITY;
+            if let Some(snap) = read_persistent::<CoverageSnapshot>(
+                &env,
+                &DataKey::HistorySlot(sac.clone(), slot),
+            ) {
+                out.push_back(snap);
+            }
+        }
+        out
+    }
+
+    /// Transfer admin rights to `new_admin`. Requires both current and new
+    /// admin to authorise.
+    ///
+    /// # Arguments
+    /// * `new_admin` - the address that will become administrator
+    ///
+    /// # Events
+    /// * [`AdminTransferred`] on success
     pub fn transfer_admin(env: Env, new_admin: Address) {
         admin(&env).require_auth();
         new_admin.require_auth();
@@ -576,6 +753,12 @@ impl CoverageLedger {
 
     /// Propose a wasm hash for installation after the upgrade delay. A new
     /// proposal replaces any pending one and restarts the clock.
+    ///
+    /// # Arguments
+    /// * `wasm_hash` - hash of the new wasm to install
+    ///
+    /// # Events
+    /// * [`UpgradeProposed`] on success
     pub fn propose_upgrade(env: Env, wasm_hash: BytesN<32>) {
         admin(&env).require_auth();
         let executable_at_ledger = env
@@ -598,6 +781,13 @@ impl CoverageLedger {
     }
 
     /// Install the pending wasm once its delay has elapsed.
+    ///
+    /// # Errors
+    /// * [`LedgerError::UpgradeNotProposed`] when no upgrade has been proposed
+    /// * [`LedgerError::UpgradeDelayNotElapsed`] when the delay has not yet passed
+    ///
+    /// # Events
+    /// * [`UpgradeExecuted`] on success
     pub fn execute_upgrade(env: Env) {
         admin(&env).require_auth();
         let proposed = match pending(&env) {
@@ -618,6 +808,12 @@ impl CoverageLedger {
     }
 
     /// Cancel the pending upgrade.
+    ///
+    /// # Errors
+    /// * [`LedgerError::UpgradeNotProposed`] when no upgrade has been proposed
+    ///
+    /// # Events
+    /// * [`UpgradeCancelled`] on success
     pub fn cancel_upgrade(env: Env) {
         admin(&env).require_auth();
         let proposed = match pending(&env) {
@@ -632,7 +828,7 @@ impl CoverageLedger {
         .publish(&env);
     }
 
-    /// The pending upgrade, if any.
+    /// Return the pending upgrade, if any.
     pub fn pending_upgrade(env: Env) -> Option<PendingUpgrade> {
         let proposed = pending(&env);
         if proposed.is_some() {
