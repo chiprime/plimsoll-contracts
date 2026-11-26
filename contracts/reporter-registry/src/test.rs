@@ -297,9 +297,8 @@ fn revoke_role_emits_event() {
     let (env, _admin, client) = setup();
     let who = Address::generate(&env);
     client.assign_role(&who, &RegistryRole::Observer);
-    let event_count_before = env.events().all().events().len();
     client.revoke_role(&who);
-    assert_eq!(env.events().all().events().len(), event_count_before + 1);
+    assert_eq!(env.events().all().events().len(), 1);
 }
 
 #[test]
