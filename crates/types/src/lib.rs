@@ -152,6 +152,8 @@ pub struct CoverageSnapshot {
     pub tier: Tier,
     pub ledger: u32,
     pub timestamp: u64,
+}
+
 /// The ratio a `CoverageStatus::Covered` answer carries.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
