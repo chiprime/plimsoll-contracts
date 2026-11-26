@@ -2,9 +2,7 @@
 //! cross-contract calls between them.
 #![no_std]
 
-use soroban_sdk::{contractclient, contracttype, Address, BytesN, Env, String, Vec};
-
-use soroban_sdk::{contractclient, contracttype, Address, Bytes, BytesN, Env, String, Symbol};
+use soroban_sdk::{contractclient, contracttype, Address, Bytes, BytesN, Env, String, Symbol, Vec};
 
 /// One day of ledgers at a 5-second close time.
 pub const DAY_IN_LEDGERS: u32 = 17_280;
